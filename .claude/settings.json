@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m unittest:*)",
+      "Bash(python3 brain.py context:*)",
+      "Bash(python3 brain.py search:*)",
+      "Bash(python3 brain.py show:*)",
+      "Bash(python3 brain.py list:*)",
+      "Bash(python3 brain.py review)",
+      "Bash(python3 brain.py stats)",
+      "Bash(python3 brain.py audit)",
+      "Bash(python3 -m radar.gha:*)"
+    ]
+  }
+}

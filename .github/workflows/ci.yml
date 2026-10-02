@@ -1,0 +1,68 @@
+# Tests + one live PAPER pass against the free DEX API. Writes nothing back:
+# no cache save, no Pages deploy, no issue comments.
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install GA dependencies (3.14 only; pins need Python >= 3.12)
+        if: matrix.python-version == '3.14'
+        run: python3 -m pip install -q -r evolution/requirements.txt
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      STATE: ${{ github.workspace }}/.gha_state
+      CONFIG: radar/config.gha.json
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Two live passes on a throwaway state (no secrets)
+        run: |
+          python3 brain.py --db "$STATE/memory.sqlite3" bootstrap > /dev/null
+          python3 -m radar --state "$STATE" --config "$CONFIG" once
+          sleep 20
+          python3 -m radar --state "$STATE" --config "$CONFIG" once
+      - name: Check feeds and build site + digest
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          d = json.load(open(os.environ['STATE'] + '/status.json'))
+          feeds = {f['name']: f['state'] for f in d['feeds']}
+          print(json.dumps(feeds, indent=2))
+          assert d['runtime_error'] is None, d['runtime_error']
+          assert feeds.get('dex:profiles') in ('ok', 'ok_empty'), feeds
+          assert any(k.startswith('dex:quotes:') and v in ('ok', 'ok_empty') for k, v in feeds.items()), feeds
+          assert feeds.get('nansen') == 'missing_credential', feeds
+          print('paper', d['paper']['cash'], len(d['paper']['open']), len(d['paper']['closed']))
+          EOF
+          python3 -m radar.gha --state "$STATE" digest --out digest.md > /dev/null
+          python3 -m radar.gha --state "$STATE" site --config "$CONFIG" --out _site
+          cat digest.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site-preview
+          path: _site
+          include-hidden-files: true
+          retention-days: 3
