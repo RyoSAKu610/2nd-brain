@@ -1,0 +1,195 @@
+# Scheduled Solana PAPER radar on the free GitHub Actions tier (public repo: no minute limit).
+# One pass per run; state (SQLite) is carried between runs in the Actions cache,
+# with a 6-hourly backup artifact as a fallback. No live trading, no signer, no wallet keys.
+name: radar
+
+on:
+  schedule:
+    # Offset from :00 to avoid the busiest scheduler slots. GitHub may still delay runs.
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_digest:
+        description: "Post the research digest now (ignores the 6h gate)"
+        type: boolean
+        default: false
+      force_evolution:
+        description: "Run the GA experiment now (ignores the weekly gate)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Every job that touches the cached state shares this group, so runs never race.
+concurrency:
+  group: radar-state
+  cancel-in-progress: false
+
+env:
+  STATE: .gha_state
+  CONFIG: radar/config.gha.json
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: write   # restore backup artifact, delete superseded caches
+      issues: write    # 6-hourly digest comment
+      pages: read      # detect whether Pages is enabled
+    outputs:
+      pages: ${{ steps.pages.outputs.enabled }}
+    env:
+      # Optional. Unset secret => empty => Nansen stays "missing_credential"; free DEX data continues.
+      NANSEN_API_KEY: ${{ secrets.NANSEN_API_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Restore state from cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.STATE }}
+          key: radar-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: radar-state-
+
+      - name: Fallback restore from latest backup artifact
+        if: steps.cache.outputs.cache-matched-key == ''
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=radar-state-backup&per_page=1" \
+                 --jq '.artifacts[] | select(.expired == false) | .id' 2>/dev/null | head -n1 || true)
+          if [ -n "$id" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$RUNNER_TEMP/state.zip"
+            mkdir -p "$STATE" && unzip -o -q "$RUNNER_TEMP/state.zip" -d "$STATE"
+            echo "::notice::State restored from backup artifact $id"
+          else
+            echo "::notice::No cache or backup found; starting a new PAPER series at the configured cash."
+          fi
+
+      - name: Seed brain memory policies (idempotent)
+        run: python3 brain.py --db "$STATE/memory.sqlite3" bootstrap
+
+      - name: Radar pass (single tick)
+        id: tick
+        run: |
+          set +e
+          python3 -m radar --state "$STATE" --config "$CONFIG" once
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Daily maintenance (prune raw observations > 30 days)
+        run: python3 -m radar.gha --state "$STATE" maintain --retention-days 30
+
+      - name: Weekly GA experiment gate
+        id: ga
+        run: |
+          if [ "${{ inputs.force_evolution }}" = "true" ]; then echo "due=true" >> "$GITHUB_OUTPUT";
+          else echo "due=$(python3 -m radar.gha --state "$STATE" due evolution 168)" >> "$GITHUB_OUTPUT"; fi
+
+      - name: GA experiment (research only, never applied to the bot)
+        if: steps.ga.outputs.due == 'true'
+        continue-on-error: true
+        run: |
+          python3 -m pip install -q -r evolution/requirements.txt
+          python3 -m evolution run --database "$STATE/radar.sqlite3" --config "$CONFIG" --output "$STATE/evolution-runs"
+          python3 -m radar.gha --state "$STATE" mark evolution
+
+      - name: 6-hour digest gate
+        id: digest
+        run: |
+          if [ "${{ inputs.force_digest }}" = "true" ]; then echo "due=true" >> "$GITHUB_OUTPUT";
+          else echo "due=$(python3 -m radar.gha --state "$STATE" due digest 6)" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Post research digest to the tracking issue
+        if: steps.digest.outputs.due == 'true'
+        continue-on-error: true
+        run: |
+          python3 -m radar.gha --state "$STATE" digest --out "$RUNNER_TEMP/digest.md" --pages-url "$PAGES_URL" > /dev/null
+          gh label create radar-digest --color 0E8A16 --description "6-hourly PAPER radar digest" 2>/dev/null || true
+          issue=$(gh issue list --label radar-digest --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -z "$issue" ]; then
+            issue=$(gh issue create --label radar-digest --title "📡 Radar 6時間ダイジェスト (PAPER)" \
+              --body "GitHub Actions が6時間ごとにリサーチ結果をこのIssueへコメントします。PAPERのみ・実売買なし。ダッシュボード: $PAGES_URL" \
+              | grep -oE '[0-9]+$')
+          fi
+          gh issue comment "$issue" --body-file "$RUNNER_TEMP/digest.md"
+          python3 -m radar.gha --state "$STATE" digest-commit
+          python3 -m radar.gha --state "$STATE" mark digest
+          cat "$RUNNER_TEMP/digest.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build Pages site
+        run: python3 -m radar.gha --state "$STATE" site --config "$CONFIG" --out _site
+
+      - name: Backup gate (every 6h)
+        id: backup
+        run: |
+          due=$(python3 -m radar.gha --state "$STATE" due backup 6)
+          [ "$due" = "true" ] && python3 -m radar.gha --state "$STATE" mark backup
+          echo "due=$due" >> "$GITHUB_OUTPUT"
+
+      - name: Save state to cache
+        if: always() && hashFiles('.gha_state/radar.sqlite3') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.STATE }}
+          key: radar-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload state backup artifact
+        if: steps.backup.outputs.due == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: radar-state-backup
+          path: |
+            ${{ env.STATE }}/*.sqlite3
+            ${{ env.STATE }}/*.json
+            ${{ env.STATE }}/evolution-runs/
+          include-hidden-files: false
+          retention-days: 7
+
+      - name: Delete superseded state caches (keep newest 3)
+        continue-on-error: true
+        run: |
+          gh cache list --key radar-state- --sort created_at --order desc --limit 100 --json id --jq '.[3:][].id' \
+            | xargs -r -n1 gh cache delete
+
+      - name: Detect GitHub Pages (Settings > Pages > Source = GitHub Actions)
+        id: pages
+        run: |
+          type=$(gh api "repos/$GITHUB_REPOSITORY/pages" --jq .build_type 2>/dev/null || true)
+          if [ "$type" = "workflow" ]; then echo "enabled=true" >> "$GITHUB_OUTPUT"; else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Pages is not set to 'GitHub Actions' yet; skipping deploy. Settings > Pages > Source: GitHub Actions"
+          fi
+
+      - name: Upload Pages artifact
+        if: steps.pages.outputs.enabled == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Report tick result
+        run: |
+          python3 -c "import json;d=json.load(open('$STATE/status.json'));p=d['paper'];print('paper cash',p['cash'],'pnl',p['realized_pnl'],'open',len(p['open']),'closed',len(p['closed']));print('runtime_error',d.get('runtime_error'));[print(f['name'],f['state'],f.get('last_error') or '') for f in d['feeds']]"
+          test "${{ steps.tick.outputs.code }}" = "0"
+
+  deploy:
+    needs: tick
+    if: always() && needs.tick.outputs.pages == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
